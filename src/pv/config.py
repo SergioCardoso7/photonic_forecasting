@@ -29,6 +29,7 @@ class Settings(BaseSettings):
         "https://historical-forecast-api.open-meteo.com/v1/forecast"
     )
     open_meteo_forecast_url: str = "https://api.open-meteo.com/v1/forecast"
+    open_meteo_previous_runs_url: str = "https://previous-runs-api.open-meteo.com/v1/forecast"
     request_timeout_s: float = 30.0
 
     def layer_path(self, layer: Layer, dataset: str) -> Path:
