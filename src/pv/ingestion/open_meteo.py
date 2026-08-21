@@ -34,7 +34,23 @@ from pv.config import Layer, settings
 
 log = structlog.get_logger(__name__)
 
-HOURLY_VARIABLES: Final[tuple[str, ...]] = ()
+HOURLY_VARIABLES: Final[tuple[str, ...]] = (
+    "shortwave_radiation",
+    "direct_radiation",
+    "diffuse_radiation",
+    "direct_normal_irradiance",
+    "temperature_2m",
+    "relative_humidity_2m",
+    "dew_point_2m",
+    "cloud_cover",
+    "cloud_cover_low",
+    "cloud_cover_mid",
+    "cloud_cover_high",
+    "wind_speed_10m",
+    "surface_pressure",
+    "precipitation",
+    "is_day",
+)
 
 MAX_LEAD_DAYS: Final[int] = 7
 
@@ -62,6 +78,11 @@ class WeatherSource(StrEnum):
                 return settings.open_meteo_previous_runs_url
             case WeatherSource.LIVE_FORECAST:
                 return settings.open_meteo_forecast_url
+
+    @property
+    def is_operational(self) -> bool:
+        """True when the values would have been available before valid time."""
+        return self is not WeatherSource.ERA5
 
 
 def _suffix_variables_for_previous_runs(variables: Sequence[str], lead_days: int) -> list[str]:
@@ -126,16 +147,6 @@ def build_params(
     return params
 
 
-def _raw_cache_path(url: str, params: dict[str, Any]) -> Path:
-    return settings.data_root / "bronze" / "_raw" / f"{_cache_key(url, params)}.json"
-
-
-def _cache_key(url: str, params: dict[str, Any]) -> str:
-    """Return a stable hash of a request, used as the raw-response filename."""
-    payload = json.dumps({"url": url, "params": params}, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]
-
-
 def _get_with_retry(
     client: httpx.Client,
     url: str,
@@ -173,7 +184,7 @@ def _get_with_retry(
 
 
 def to_frame(payload: dict[str, Any], source: WeatherSource, lead_days: int | None) -> pd.DataFrame:
-    """Convert an Open-Meteo JSON payload into a tidy, UTC-indexed frame.
+    """Convert an Open-Meteo JSON payload into UTC-indexed frame.
 
     Column names are normalised across sources: a previous-runs response with
     ``temperature_2m_previous_day1`` becomes plain ``temperature_2m``, so
@@ -254,9 +265,7 @@ def fetch_hourly(
 def bronze_path(site_id: str, source: WeatherSource, lead_days: int | None) -> Path:
     """Return the bronze partition directory for one site and weather source.
 
-    Partitioned by month rather than day: a day-partitioned weather table would
-    produce ~65k tiny Parquet files across 60 sites and three years, which is
-    slower to scan than one file per month.
+    Partitioned by month rather than day
     """
     lead = lead_days if lead_days is not None else 0
     return (
@@ -290,3 +299,13 @@ def write_bronze(
         log.info("bronze.write", path=str(target), rows=len(group))
 
     return written
+
+
+def _raw_cache_path(url: str, params: dict[str, Any]) -> Path:
+    return settings.data_root / "bronze" / "_raw" / f"{_cache_key(url, params)}.json"
+
+
+def _cache_key(url: str, params: dict[str, Any]) -> str:
+    """Return a stable hash of a request, used as the raw-response filename."""
+    payload = json.dumps({"url": url, "params": params}, sort_keys=True)
+    return hashlib.sha256(payload.encode()).hexdigest()[:16]
