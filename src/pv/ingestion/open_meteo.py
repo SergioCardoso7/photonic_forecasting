@@ -17,9 +17,6 @@ Four sources are supported.
 
 from __future__ import annotations
 
-import hashlib
-import json
-import time
 from collections.abc import Sequence
 from datetime import date
 from enum import StrEnum
@@ -31,8 +28,12 @@ import pandas as pd
 import structlog
 
 from pv.config import Layer, settings
+from pv.ingestion._http_utils import IngestionError, get_json_cached
 
 log = structlog.get_logger(__name__)
+
+NAMESPACE: Final[str] = "open_meteo"
+MAX_LEAD_DAYS: Final[int] = 7
 
 HOURLY_VARIABLES: Final[tuple[str, ...]] = (
     "shortwave_radiation",
@@ -52,10 +53,8 @@ HOURLY_VARIABLES: Final[tuple[str, ...]] = (
     "is_day",
 )
 
-MAX_LEAD_DAYS: Final[int] = 7
 
-
-class OpenMeteoError(RuntimeError):
+class OpenMeteoError(IngestionError):
     """Raised when the Open-Meteo API cannot be queried successfully."""
 
 
@@ -83,6 +82,11 @@ class WeatherSource(StrEnum):
     def is_operational(self) -> bool:
         """True when the values would have been available before valid time."""
         return self is not WeatherSource.ERA5
+
+    @property
+    def is_cacheable(self) -> bool:
+        """False for live forecasts, whose whole purpose is being current."""
+        return self is not WeatherSource.LIVE_FORECAST
 
 
 def _suffix_variables_for_previous_runs(variables: Sequence[str], lead_days: int) -> list[str]:
@@ -147,42 +151,6 @@ def build_params(
     return params
 
 
-def _get_with_retry(
-    client: httpx.Client,
-    url: str,
-    params: dict[str, Any],
-    max_attempts: int = 5,
-) -> dict[str, Any]:
-    """GET with exponential backoff (double of previous backoff) on rate limits and transient failures.
-
-    Open-Meteo returns 429 when the free-tier quota is exceeded.
-    """
-    backoff = 1.0
-    last_error: Exception | None = None
-
-    for attempt in range(1, max_attempts + 1):
-        try:
-            response = client.get(url, params=params)
-            if response.status_code == httpx.codes.TOO_MANY_REQUESTS:
-                raise OpenMeteoError("rate limited")
-            if response.status_code >= httpx.codes.INTERNAL_SERVER_ERROR:
-                raise OpenMeteoError(f"server error {response.status_code}")
-            response.raise_for_status()
-            payload: dict[str, Any] = response.json()
-            return payload
-        except (OpenMeteoError, httpx.HTTPError) as exc:
-            last_error = exc
-            if attempt == max_attempts:
-                break
-            log.warning(
-                "open_meteo.retry", attempt=attempt, wait_s=backoff, error=str(exc), url=url
-            )
-            time.sleep(backoff)
-            backoff *= 2
-
-    raise OpenMeteoError(f"failed after {max_attempts} attempts: {last_error}") from last_error
-
-
 def to_frame(payload: dict[str, Any], source: WeatherSource, lead_days: int | None) -> pd.DataFrame:
     """Convert an Open-Meteo JSON payload into UTC-indexed frame.
 
@@ -220,12 +188,7 @@ def fetch_hourly(
     client: httpx.Client | None = None,
     use_cache: bool = True,
 ) -> pd.DataFrame:
-    """Fetch hourly weather for one location from one Open-Meteo source.
-
-    Raw JSON responses are cached on disk by request hash, so re-running a
-    backfill is free and does not re-hit the API. Live forecasts are never
-    cached, since the whole point of them is being current.
-    """
+    """Fetch hourly weather for one location from one Open-Meteo source."""
     params = build_params(
         latitude=latitude,
         longitude=longitude,
@@ -236,76 +199,62 @@ def fetch_hourly(
         lead_days=lead_days,
         forecast_days=forecast_days,
     )
-    url = source.endpoint
-    cacheable = use_cache and source is not WeatherSource.LIVE_FORECAST
-    cache_path = _raw_cache_path(url, params)
 
-    if cacheable and cache_path.exists():
-        log.debug("open_meteo.cache_hit", path=str(cache_path))
-        payload: dict[str, Any] = json.loads(cache_path.read_text())
-    else:
-        owns_client = client is None
-        active = client or httpx.Client(timeout=settings.request_timeout_s)
-        try:
-            log.info(
-                "open_meteo.fetch", source=str(source), lat=latitude, lon=longitude, start=start
-            )
-            payload = _get_with_retry(active, url, params)
-        finally:
-            if owns_client:
-                active.close()
-
-        if cacheable:
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(payload))
+    log.info(
+        "open_meteo.fetch",
+        source=str(source),
+        lat=latitude,
+        lon=longitude,
+        start=str(start),
+        end=str(end),
+        lead_days=lead_days,
+    )
+    payload = get_json_cached(
+        NAMESPACE,
+        source.endpoint,
+        params,
+        client=client,
+        use_cache=use_cache and source.is_cacheable,
+    )
 
     return to_frame(payload, source=source, lead_days=lead_days)
 
 
-def bronze_path(site_id: str, source: WeatherSource, lead_days: int | None) -> Path:
-    """Return the bronze partition directory for one site and weather source.
+def bronze_path(region_id: int, source: WeatherSource, lead_days: int | None) -> Path:
+    """Return the bronze partition directory for one region and source.
 
-    Partitioned by month rather than day
+    Keyed on ``region_id`` to match the PV_Live target table, so the silver
+    join is a straight equality on region and time.
     """
     lead = lead_days if lead_days is not None else 0
     return (
         settings.layer_path(Layer.BRONZE, "weather")
         / f"source={source}"
         / f"lead_days={lead}"
-        / f"site_id={site_id}"
+        / f"region_id={region_id}"
     )
 
 
 def write_bronze(
-    frame: pd.DataFrame, site_id: str, source: WeatherSource, lead_days: int | None
+    frame: pd.DataFrame, region_id: int, source: WeatherSource, lead_days: int | None
 ) -> list[Path]:
     """Write a weather frame to bronze as one Parquet file per month.
 
-    Whole months are overwritten rather than appended, which makes re-running
-    ingestion idempotent: the same inputs always produce the same files.
+    Monthly rather than daily partitions.
+    Whole months are overwritten rather than appended, which makes
+    re-running ingestion idempotent.
     """
     if frame.empty:
         return []
 
-    directory = bronze_path(site_id, source, lead_days)
+    directory = bronze_path(region_id, source, lead_days)
     directory.mkdir(parents=True, exist_ok=True)
 
     written: list[Path] = []
-    months = frame["time"].dt.strftime("%Y-%m")
-    for month, group in frame.groupby(months):
+    for month, group in frame.groupby(frame["time"].dt.strftime("%Y-%m")):
         target = directory / f"month={month}.parquet"
         group.to_parquet(target, index=False)
         written.append(target)
         log.info("bronze.write", path=str(target), rows=len(group))
 
     return written
-
-
-def _raw_cache_path(url: str, params: dict[str, Any]) -> Path:
-    return settings.data_root / "bronze" / "_raw" / f"{_cache_key(url, params)}.json"
-
-
-def _cache_key(url: str, params: dict[str, Any]) -> str:
-    """Return a stable hash of a request, used as the raw-response filename."""
-    payload = json.dumps({"url": url, "params": params}, sort_keys=True)
-    return hashlib.sha256(payload.encode()).hexdigest()[:16]

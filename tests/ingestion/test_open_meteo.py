@@ -2,6 +2,9 @@
 
 Unit tests use httpx.MockTransport, so they are deterministic and never touch
 the network. The single integration test is marked and excluded from CI.
+
+Filesystem isolation and instant retry backoff come from autouse fixtures in
+conftest.py, so nothing here monkeypatches settings directly.
 """
 
 from __future__ import annotations
@@ -13,6 +16,7 @@ import httpx
 import pandas as pd
 import pytest
 
+from pv.ingestion._http_utils import IngestionError
 from pv.ingestion.open_meteo import (
     OpenMeteoError,
     WeatherSource,
@@ -25,8 +29,8 @@ from pv.ingestion.open_meteo import (
 
 def _payload(times: list[str], **series: list[Any]) -> dict[str, Any]:
     return {
-        "latitude": 22.3,
-        "longitude": 114.2,
+        "latitude": 53.4,
+        "longitude": -1.5,
         "hourly": {"time": times, **series},
     }
 
@@ -38,22 +42,33 @@ def _mock_client(payload: dict[str, Any], status: int = 200) -> httpx.Client:
     return httpx.Client(transport=httpx.MockTransport(handler))
 
 
+class TestWeatherSource:
+    def test_only_era5_is_non_operational(self):
+        assert not WeatherSource.ERA5.is_operational
+        assert WeatherSource.PREVIOUS_RUNS.is_operational
+        assert WeatherSource.LIVE_FORECAST.is_operational
+
+    def test_live_forecast_is_never_cacheable(self):
+        assert not WeatherSource.LIVE_FORECAST.is_cacheable
+        assert WeatherSource.ERA5.is_cacheable
+
+
 class TestBuildParams:
     def test_era5_requires_dates(self):
         with pytest.raises(ValueError, match="start and end are required"):
-            build_params(22.3, 114.2, WeatherSource.ERA5)
+            build_params(53.4, -1.5, WeatherSource.ERA5)
 
     def test_rejects_reversed_date_range(self):
         with pytest.raises(ValueError, match="is after end"):
             build_params(
-                22.3, 114.2, WeatherSource.ERA5, start=date(2024, 5, 2), end=date(2024, 5, 1)
+                53.4, -1.5, WeatherSource.ERA5, start=date(2024, 5, 2), end=date(2024, 5, 1)
             )
 
     def test_previous_runs_requires_lead_days(self):
         with pytest.raises(ValueError, match="lead_days is required"):
             build_params(
-                22.3,
-                114.2,
+                53.4,
+                -1.5,
                 WeatherSource.PREVIOUS_RUNS,
                 start=date(2024, 5, 1),
                 end=date(2024, 5, 2),
@@ -63,8 +78,8 @@ class TestBuildParams:
     def test_previous_runs_rejects_out_of_range_lead(self, lead):
         with pytest.raises(ValueError, match="between 1 and 7"):
             build_params(
-                22.3,
-                114.2,
+                53.4,
+                -1.5,
                 WeatherSource.PREVIOUS_RUNS,
                 start=date(2024, 5, 1),
                 end=date(2024, 5, 2),
@@ -73,23 +88,21 @@ class TestBuildParams:
 
     def test_previous_runs_suffixes_every_variable(self):
         params = build_params(
-            22.3,
-            114.2,
+            53.4,
+            -1.5,
             WeatherSource.PREVIOUS_RUNS,
             start=date(2024, 5, 1),
             end=date(2024, 5, 2),
             variables=["temperature_2m", "shortwave_radiation"],
             lead_days=1,
         )
-        assert params["hourly"] == (
-            "temperature_2m_previous_day1,shortwave_radiation_previous_day1"
-        )
+        assert params["hourly"] == "temperature_2m_previous_day1,shortwave_radiation_previous_day1"
 
     def test_lead_days_rejected_for_non_previous_runs(self):
         with pytest.raises(ValueError, match="only meaningful for previous runs"):
             build_params(
-                22.3,
-                114.2,
+                53.4,
+                -1.5,
                 WeatherSource.ERA5,
                 start=date(2024, 5, 1),
                 end=date(2024, 5, 2),
@@ -97,13 +110,13 @@ class TestBuildParams:
             )
 
     def test_live_forecast_uses_forecast_days_not_dates(self):
-        params = build_params(22.3, 114.2, WeatherSource.LIVE_FORECAST, forecast_days=2)
+        params = build_params(53.4, -1.5, WeatherSource.LIVE_FORECAST, forecast_days=2)
         assert params["forecast_days"] == 2
         assert "start_date" not in params
 
     def test_always_requests_utc(self):
         params = build_params(
-            22.3, 114.2, WeatherSource.ERA5, start=date(2024, 5, 1), end=date(2024, 5, 1)
+            53.4, -1.5, WeatherSource.ERA5, start=date(2024, 5, 1), end=date(2024, 5, 1)
         )
         assert params["timezone"] == "UTC"
 
@@ -144,16 +157,20 @@ class TestToFrame:
 
     def test_rejects_payload_without_hourly_block(self):
         with pytest.raises(OpenMeteoError, match="no hourly block"):
-            to_frame({"latitude": 22.3}, WeatherSource.ERA5, lead_days=None)
+            to_frame({"latitude": 53.4}, WeatherSource.ERA5, lead_days=None)
+
+    def test_error_is_catchable_as_ingestion_error(self):
+        """Callers should be able to catch any ingestion failure generically."""
+        with pytest.raises(IngestionError):
+            to_frame({}, WeatherSource.ERA5, lead_days=None)
 
 
 class TestFetchHourly:
-    def test_returns_frame_from_mocked_response(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("pv.ingestion.open_meteo.settings.data_root", tmp_path)
+    def test_returns_frame_from_mocked_response(self):
         payload = _payload(["2024-05-01T00:00", "2024-05-01T01:00"], temperature_2m=[20.0, 21.0])
         frame = fetch_hourly(
-            22.3,
-            114.2,
+            53.4,
+            -1.5,
             WeatherSource.ERA5,
             start=date(2024, 5, 1),
             end=date(2024, 5, 1),
@@ -162,8 +179,7 @@ class TestFetchHourly:
         )
         assert len(frame) == 2
 
-    def test_second_call_is_served_from_cache(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("pv.ingestion.open_meteo.settings.data_root", tmp_path)
+    def test_second_call_is_served_from_cache(self):
         payload = _payload(["2024-05-01T00:00"], temperature_2m=[20.0])
         calls = {"n": 0}
 
@@ -172,9 +188,9 @@ class TestFetchHourly:
             return httpx.Response(200, json=payload)
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        kwargs = {
-            "latitude": 22.3,
-            "longitude": 114.2,
+        kwargs: dict[str, Any] = {
+            "latitude": 53.4,
+            "longitude": -1.5,
             "source": WeatherSource.ERA5,
             "start": date(2024, 5, 1),
             "end": date(2024, 5, 1),
@@ -185,18 +201,35 @@ class TestFetchHourly:
         fetch_hourly(**kwargs)
         assert calls["n"] == 1
 
-    def test_raises_after_exhausting_retries(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("pv.ingestion.open_meteo.settings.data_root", tmp_path)
-        monkeypatch.setattr("pv.ingestion.open_meteo.time.sleep", lambda _: None)
+    def test_live_forecast_bypasses_the_cache(self):
+        """A cached forecast served in production would be a silent bug."""
+        payload = _payload(["2024-05-01T00:00"], temperature_2m=[20.0])
+        calls = {"n": 0}
 
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["n"] += 1
+            return httpx.Response(200, json=payload)
+
+        client = httpx.Client(transport=httpx.MockTransport(handler))
+        for _ in range(2):
+            fetch_hourly(
+                53.4,
+                -1.5,
+                WeatherSource.LIVE_FORECAST,
+                variables=["temperature_2m"],
+                client=client,
+            )
+        assert calls["n"] == 2
+
+    def test_raises_after_exhausting_retries(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return httpx.Response(500, json={})
 
         client = httpx.Client(transport=httpx.MockTransport(handler))
-        with pytest.raises(OpenMeteoError, match="failed after"):
+        with pytest.raises(IngestionError, match="failed after"):
             fetch_hourly(
-                22.3,
-                114.2,
+                53.4,
+                -1.5,
                 WeatherSource.ERA5,
                 start=date(2024, 5, 1),
                 end=date(2024, 5, 1),
@@ -206,31 +239,28 @@ class TestFetchHourly:
 
 
 class TestWriteBronze:
-    def test_splits_by_month_and_is_idempotent(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("pv.ingestion.open_meteo.settings.data_root", tmp_path)
+    def test_splits_by_month_and_is_idempotent(self):
         times = pd.date_range("2024-05-30", "2024-06-02", freq="h", tz="UTC")
         frame = pd.DataFrame(
             {"time": times, "temperature_2m": range(len(times)), "source": "era5", "lead_days": 0}
         )
 
-        first = write_bronze(frame, "HK07", WeatherSource.ERA5, lead_days=None)
-        second = write_bronze(frame, "HK07", WeatherSource.ERA5, lead_days=None)
+        first = write_bronze(frame, 10, WeatherSource.ERA5, lead_days=None)
+        second = write_bronze(frame, 10, WeatherSource.ERA5, lead_days=None)
 
-        assert len(first) == 2
         assert {p.name for p in first} == {"month=2024-05.parquet", "month=2024-06.parquet"}
         assert first == second
 
-    def test_empty_frame_writes_nothing(self, tmp_path, monkeypatch):
-        monkeypatch.setattr("pv.ingestion.open_meteo.settings.data_root", tmp_path)
-        assert write_bronze(pd.DataFrame(), "HK07", WeatherSource.ERA5, None) == []
+    def test_empty_frame_writes_nothing(self):
+        assert write_bronze(pd.DataFrame(), 10, WeatherSource.ERA5, None) == []
 
 
 @pytest.mark.integration
 def test_live_api_returns_expected_variables():
     """Hits the real API. Run with `make test-all`, excluded from CI."""
     frame = fetch_hourly(
-        latitude=22.3,
-        longitude=114.2,
+        latitude=53.4,
+        longitude=-1.5,
         source=WeatherSource.PREVIOUS_RUNS,
         start=date(2024, 6, 1),
         end=date(2024, 6, 2),
