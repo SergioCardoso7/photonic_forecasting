@@ -10,7 +10,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Layer(StrEnum):
-    """Medallion later of the data lake"""
+    """Medallion layer of the data lake"""
 
     BRONZE = "bronze"
     SILVER = "silver"
@@ -18,12 +18,11 @@ class Layer(StrEnum):
 
 
 class Settings(BaseSettings):
-    "Runtime configuration"
+    """Runtime configuration"""
 
     model_config = SettingsConfigDict(env_prefix="PV_", env_file=".env")
 
     data_root: Path = Field(default=Path("data"))
-    duckdb_path: Path = Field(default=Path("data/pv.duckdb"))
     open_meteo_archive_url: str = "https://archive-api.open-meteo.com/v1/archive"
     open_meteo_historical_forecast_url: str = (
         "https://historical-forecast-api.open-meteo.com/v1/forecast"
@@ -39,6 +38,10 @@ class Settings(BaseSettings):
     def partition_path(self, layer: Layer, dataset: str, site_id: str, date: str) -> Path:
         """Return a Hive-partitioned path: <layer>/<dataset>/site_id=X/date=Y."""
         return self.layer_path(layer, dataset) / f"site_id={site_id}" / f"date={date}"
+
+    def duckdb_path(self) -> Path:
+        """Database file co-located with the lake"""
+        return self.data_root / "pv.duckdb"
 
 
 settings = Settings()

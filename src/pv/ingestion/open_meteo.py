@@ -2,14 +2,16 @@
 
 Four sources are supported.
 
-- ERA5                      reanalysis, reconstructed after the fact. Ground truth only. Using it as a training feature is the
-                            look-ahead bias this project exists to quantify.
+- ERA5                      reanalysis, reconstructed after the fact. Ground truth only.
 
-- HISTORICAL_FORECAST       archived operational model output, stitched from the first hours of each run. Effective lead time is only
+
+- HISTORICAL_FORECAST       archived operational model output,
+                            stitched from the first hours of each run. Effective lead time is only
                             a few hours, so it is realistic for nowcasting but not for day-ahead.
 
-- PREVIOUS_RUNS             forecast values at a fixed lead-time offset of 1-7 days. This is what a day-ahead model would actually
-                            have seen. Archived from January 2024.
+- PREVIOUS_RUNS             forecast values at a fixed lead-time offset of 1-7 days.
+                            This is what a day-ahead model would actually have seen.
+                            Archived from January 2024.
 
 - LIVE_FORECAST             the real forecast, for serving.
 
@@ -51,6 +53,20 @@ HOURLY_VARIABLES: Final[tuple[str, ...]] = (
     "surface_pressure",
     "precipitation",
     "is_day",
+)
+
+BACKWARD_LOOKING: Final[frozenset[str]] = frozenset(
+    {
+        "shortwave_radiation",
+        "direct_radiation",
+        "diffuse_radiation",
+        "direct_normal_irradiance",
+        "global_tilted_irradiance",
+        "terrestrial_radiation",
+        "precipitation",
+        "rain",
+        "snowfall",
+    }
 )
 
 
@@ -173,7 +189,11 @@ def to_frame(payload: dict[str, Any], source: WeatherSource, lead_days: int | No
     frame["latitude"] = payload.get("latitude")
     frame["longitude"] = payload.get("longitude")
 
-    return frame.sort_values("time").reset_index(drop=True)
+    frame = frame.sort_values("time").reset_index(drop=True)
+    shiftable = [c for c in frame.columns if c in BACKWARD_LOOKING]
+    if shiftable:
+        frame[shiftable] = frame[shiftable].shift(-1)
+    return frame
 
 
 def fetch_hourly(

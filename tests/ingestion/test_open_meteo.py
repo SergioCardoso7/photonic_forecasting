@@ -164,6 +164,19 @@ class TestToFrame:
         with pytest.raises(IngestionError):
             to_frame({}, WeatherSource.ERA5, lead_days=None)
 
+    def test_backward_looking_variables_are_relabelled(self):
+        """Radiation is a preceding-hour mean; temperature is instantaneous."""
+        payload = _payload(
+            ["2024-05-01T00:00", "2024-05-01T01:00", "2024-05-01T02:00"],
+            shortwave_radiation=[10.0, 20.0, 30.0],
+            temperature_2m=[5.0, 6.0, 7.0],
+        )
+        frame = to_frame(payload, WeatherSource.ERA5, lead_days=None)
+
+        assert frame["shortwave_radiation"].tolist()[:2] == [20.0, 30.0]
+        assert pd.isna(frame["shortwave_radiation"].iloc[-1])
+        assert frame["temperature_2m"].tolist() == [5.0, 6.0, 7.0]
+
 
 class TestFetchHourly:
     def test_returns_frame_from_mocked_response(self):
