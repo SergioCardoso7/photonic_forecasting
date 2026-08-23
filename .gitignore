@@ -12,3 +12,4 @@ data/
 mlruns/
 .ipynb_checkpoints/
 .DS_Store
+scratch_*

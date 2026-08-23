@@ -270,6 +270,7 @@ def write_bronze(
     directory = bronze_path(region_id, source, lead_days)
     directory.mkdir(parents=True, exist_ok=True)
 
+    frame = frame.assign(region_id=region_id)
     written: list[Path] = []
     for month, group in frame.groupby(frame["time"].dt.strftime("%Y-%m")):
         target = directory / f"month={month}.parquet"

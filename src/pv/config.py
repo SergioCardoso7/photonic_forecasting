@@ -39,6 +39,7 @@ class Settings(BaseSettings):
         """Return a Hive-partitioned path: <layer>/<dataset>/site_id=X/date=Y."""
         return self.layer_path(layer, dataset) / f"site_id={site_id}" / f"date={date}"
 
+    @property
     def duckdb_path(self) -> Path:
         """Database file co-located with the lake"""
         return self.data_root / "pv.duckdb"

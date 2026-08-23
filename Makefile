@@ -27,6 +27,9 @@ update:
 	uv lock --upgrade
 	uv sync
 
+silver:
+	uv run python -m pv.transform.silver
+
 clean:
 	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage
 	find . -type d -name __pycache__ -exec rm -rf {} +
