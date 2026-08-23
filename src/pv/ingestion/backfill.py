@@ -107,24 +107,6 @@ def backfill_weather(start: date, end: date, client: httpx.Client) -> int:
     return total
 
 
-def capture_vintage(client: httpx.Client, entity_type: EntityType = EntityType.PES) -> int:
-    """Capture the currently-published outturn for every region.
-
-    Intended to run on a schedule. These rows record what a live system would
-    have seen before PV_Live revised its estimates, and they cannot be
-    reconstructed after the fact -- which is why this runs from day one, long
-    before anything consumes it.
-    """
-    total = 0
-    for region in regions.PES_REGIONS:
-        frame = pv_live.fetch_vintage(region.region_id, entity_type, client=client)
-        pv_live.append_vintage(frame)
-        total += len(frame)
-        time.sleep(REQUEST_DELAY_S)
-    log.info("vintage.captured", rows=total, at=datetime.now(UTC).isoformat())
-    return total
-
-
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start", type=date.fromisoformat, default=PREVIOUS_RUNS_START)
@@ -134,7 +116,6 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=(datetime.now(UTC) - timedelta(days=1)).date(),
     )
     parser.add_argument("--verify-regions", action="store_true", help="check metadata and exit")
-    parser.add_argument("--vintage-only", action="store_true", help="capture a vintage and exit")
     parser.add_argument("--skip-weather", action="store_true")
     parser.add_argument("--skip-outturn", action="store_true")
     return parser.parse_args(argv)
@@ -148,10 +129,6 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     with httpx.Client(timeout=settings.request_timeout_s) as client:
-        if args.vintage_only:
-            capture_vintage(client)
-            return 0
-
         if args.start > args.end:
             print(f"start {args.start} is after end {args.end}", file=sys.stderr)
             return 1
