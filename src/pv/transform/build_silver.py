@@ -7,7 +7,7 @@ downstream will trust it.
 
 Run as a module:
 
-    uv run python -m pv.transform.silver
+    uv run python -m pv.transform.build_silver
 """
 
 from __future__ import annotations

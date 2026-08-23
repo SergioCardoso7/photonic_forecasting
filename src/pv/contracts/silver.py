@@ -24,7 +24,6 @@ import numpy as np
 import pandas as pd
 import pandera.pandas as pa
 import pvlib
-from pandera.typing import Series
 
 from pv.ingestion.regions import BY_ID
 
@@ -133,4 +132,4 @@ SILVER_WEATHER: Final[pa.DataFrameSchema] = pa.DataFrameSchema(
 )
 
 
-__all__ = ["SILVER_PV", "SILVER_WEATHER", "Series"]
+__all__ = ["SILVER_PV", "SILVER_WEATHER"]
