@@ -18,7 +18,9 @@ WITH raw AS (
         diffuse_radiation,
         direct_normal_irradiance,
         temperature_2m,
-        relative_humidity_2m,
+        """Adding this constraint since open-meteo can return RH slightly above as derivation artefact
+        of dew point and temperature"""
+        least(greatest(relative_humidity_2m, 0.0),100.0) AS relative_humidity_2m,
         dew_point_2m,
         cloud_cover,
         cloud_cover_low,
